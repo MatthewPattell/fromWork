@@ -1,0 +1,386 @@
+import dayjs from 'dayjs';
+
+import { HOUSEHOLD_ERROR_MESSAGES, IMAGE_RECYCLING, RECURRING } from '@constants';
+
+import {
+  takeEvery, call, put, select, all,
+} from 'redux-saga/effects';
+
+import { ScannerActions2, ScannerTypes2 } from 'src/Reducers/Scanner2';
+import { AppTrophyNotificationActions } from 'src/Reducers/AppTrophyNotification';
+import { UserActions } from 'src/Reducers/User';
+import { TrophiesActions } from 'src/Reducers/Trophies';
+import { selectCountryCode, selectSelectedCountry } from 'src/Selectors/AppSettings';
+import { selectUserTrophies, selectRecycleHistory, selectId } from 'src/Selectors/User';
+import { selectBaseTrophies } from 'src/Selectors/Trophies';
+import Log from 'src/Services/Log';
+
+// Services
+import {
+  getInviteDetailsByLinkApi,
+  getInviteDetailsHouseholdByLinkApi,
+  checkDeepLinkApi,
+} from 'src/Services/Api/endpoints';
+import AnalyticsService from 'src/Services/Analytics';
+import { ANALYTICS_EVENTS } from 'src/Services/Analytics/events';
+
+import createEndpointSaga, { checkAuthHeader } from 'src/Sagas/Utils/endpointSaga';
+import updateCurrentTrophiesState from 'src/Sagas/Utils/updateCurrentTrophiesState';
+import { updateTrophiesRequestSaga, getTrophyStatusSaga } from 'src/Sagas/Trophies';
+
+import { getValueFromPath } from 'src/Utils/helpers';
+import { deviceInfo } from 'src/Utils/deviceInfo';
+import handleError from 'src/Sagas/Utils/handleError';
+
+import {
+  ShoppingListActions,
+} from 'src/Reducers/ShoppingList';
+
+import { checkEntityAccess, isDateBetweenRangeByDate } from 'src/Screens/Challenges/utils';
+import { selectAccountId } from 'src/Selectors/Balance';
+import { HouseholdActions } from 'src/Reducers/Household';
+import {
+  createLocalUserTrophy,
+} from './helpers';
+import { invitationErrorHadling } from '../Household';
+
+function* shoppingListInvitingSaga(val) {
+  try {
+    const data = { inviteLink: val };
+    const res = yield call(getInviteDetailsByLinkApi, data);
+    yield call(checkAuthHeader, res);
+    const isSuccess = getValueFromPath(res, 'body.success');
+    if (isSuccess) {
+      yield put(ShoppingListActions.setIsVisibleInvitingPopup(true));
+      yield put(ShoppingListActions.getInviteDetailsSuccess(res.body.result));
+    } else {
+      yield put(ShoppingListActions.getInviteDetailsFail());
+    }
+  } catch (error) {
+    // invite link is expired
+    if (error.status === 400) {
+      yield put(ShoppingListActions.setIsVisibleErrorInvitingPopup(true));
+      yield put(ShoppingListActions.getInviteDetailsSuccess({ error: true }));
+    } else {
+      yield call(handleError, {
+        error,
+        failAction: ShoppingListActions.getInviteDetailsFail,
+        errorAction: ShoppingListActions.getInviteDetailsError,
+      });
+    }
+  }
+}
+
+function* updateTrophiesOnScanSaga() {
+  yield call(updateCurrentTrophiesState);
+}
+
+function* calculateUserTrophiesSaga({ data }) {
+  try {
+    const recycleHistory = yield select(selectRecycleHistory());
+    const trophies = yield select(selectBaseTrophies());
+    const userTrophies = yield select(selectUserTrophies());
+    const accountId = yield select(selectAccountId());
+    const selectedCountry = yield select(selectSelectedCountry());
+    const countryCode = selectedCountry?.countryCode;
+    const userId = yield select(selectId());
+
+    // recycling station status
+    const isStationPending = data?.supportedMaterialScans?.some(it => it.station.status === 'PENDING');
+
+    // success recycling data
+    let packagesAmount = 0;
+    const CO2 = data?.supportedMaterialScans?.reduce((acc, it) => {
+      if (String(it.addedPerson) === String(userId)) {
+        packagesAmount += 1; // if owner of scan(s) - is current user
+        return acc + it.co2;
+      }
+      return acc;
+    }, 0) ?? 0;
+
+    const notifArray = [];
+    const analyticsArray = [];
+    const newUserTrophies = [];
+    // FOR SHOWING MODAL NEED PUSH TO notifArray, analyticsArray;
+    // FOR LOCAL UPDATING TROPHY NEED PUSH ITEM TO newUserTrophies;
+    function* handleTrophySaga(basicTrophy) {
+      let userTrophy = userTrophies?.find(item => item.achievement?.system_id === basicTrophy.system_id);
+      const levelBasedTrophiesIds = ['recycle_times', 'saved_co2', 'recycle_packages'];
+      if (basicTrophy.accessAndCampaign.length) {
+        const shouldShow = checkEntityAccess(basicTrophy.accessAndCampaign, accountId);
+        if (!shouldShow) {
+          return;
+        }
+      }
+      // for levelBasedTrophiesIds
+      if (levelBasedTrophiesIds.includes(basicTrophy.system_id)) {
+        if (!packagesAmount) { // if owner of scan(s) - not current user
+          return;
+        }
+        const {
+          newUserTrophy = null,
+          modalItem = null,
+          analyticsItem = null,
+        } = createLocalUserTrophy({
+          CO2,
+          packagesAmount,
+          basicTrophy,
+          userTrophy,
+        });
+        modalItem && notifArray.push(modalItem);
+        analyticsItem && analyticsArray.push(analyticsItem);
+        newUserTrophy && newUserTrophies.push(newUserTrophy);
+      }
+      // for RECURRING:
+      if (basicTrophy.trophy_type === RECURRING) {
+        const recycledAmount = data?.supportedMaterialScans?.reduce((count, it) => {
+          if (String(it.addedPerson) === String(userId)) {
+            if (it?.brand_id === basicTrophy?.brand_id || !basicTrophy?.brand_id) {
+              count += 1;
+            }
+          }
+          return count;
+        }, 0);
+
+        const findRecUserTrophyInRange = (system_id) => {
+          let itemInRange = null;
+          userTrophies.forEach((ut) => {
+            if (ut.achievement.system_id === system_id) {
+              if (isDateBetweenRangeByDate(
+                ut.achievement.range.from, ut.achievement.range.to, countryCode, ut.achievedAt,
+              )) {
+                itemInRange = ut;
+              }
+            }
+          });
+          return itemInRange;
+        };
+
+        userTrophy = findRecUserTrophyInRange(basicTrophy.system_id);
+        const soldOut = userTrophy ? userTrophy.achievement.sold_out : basicTrophy?.sold_out;
+        const isChallengeBetweenStartAndEndDate = userTrophy ? userTrophy.achievement.isChallengeBetweenStartAndEndDate : basicTrophy?.isChallengeBetweenStartAndEndDate;
+        if (recycledAmount && !soldOut && isChallengeBetweenStartAndEndDate) {
+          const statusData = { achievementId: basicTrophy.id, deviceUID: deviceInfo.deviceUID };
+          const lastminuitSoldOutCheck = yield call(getTrophyStatusSaga, { data: statusData });
+
+          const {
+            limit_user, register_user, passed, acquired_users = [],
+          } = lastminuitSoldOutCheck;
+
+          const isAvailable = limit_user > register_user || limit_user === -1;
+
+          // acquired_users - users who passed this challenge with this deviceUID
+          // theSameUserOnThisDevice - check if only 1 user on the same device UID
+          const theSameUserOnThisDevice = acquired_users?.includes(String(userId));
+          // if passed - user have already passed challenge, no need show modal, but:
+          if (isAvailable && (
+            !passed // <-- when getting userTrophy but still not having goal
+          || (passed && !userTrophy?.extraInfo.level && theSameUserOnThisDevice) // <-- when user gets goal and level - will be 'passed', but need to show modal
+          )) {
+            const newAmount = (userTrophy?.extraInfo.amount_packages ?? 0) + (!isStationPending ? recycledAmount : 0);
+            const newAmountPending = (userTrophy?.extraInfo.pending_amount_packages ?? 0) + (isStationPending ? recycledAmount : 0);
+            // for updating locally user trophies
+            const level = isStationPending ? 0 : (newAmount >= basicTrophy?.goal ? 1 : 0);
+            const newUserRec = {
+              achievedAt: new Date(),
+              achievement: {
+                ...basicTrophy,
+              },
+              extraInfo: {
+                level,
+                amount_packages: newAmount,
+                pending_amount_packages: newAmountPending,
+                achieved_at_level_1: userTrophy?.extraInfo.achieved_at_level_1 || (level > 0 ? new Date() : null),
+              },
+              status: level > 0 ? 'SUCCESS' : 'PENDING',
+              _id: userTrophy?._id || new Date().toISOString(),
+            };
+            newUserTrophies.push(newUserRec);
+
+            // showing complete modal only if station is approved
+            if (newAmount >= basicTrophy?.goal && !userTrophy?.extraInfo.level && !isStationPending) {
+              const analyticsData = {
+                id: basicTrophy.system_id,
+                title: basicTrophy.name,
+                level: 1,
+                type: 'recurring',
+              };
+              const item = {
+                ...analyticsData,
+                name: basicTrophy.name,
+                description: basicTrophy.description,
+                unlockExtraDescription: basicTrophy.unlock_extra_description,
+                image: basicTrophy.image.source,
+                amount: newAmount,
+                hasReward: basicTrophy.has_reward,
+                reward: {
+                  cash: basicTrophy.price?.cash,
+                  points: basicTrophy.price?.points,
+                },
+              };
+              notifArray.push(item);
+              analyticsArray.push(analyticsData);
+            }
+          }
+        }
+      }
+      // GETTING STARTED TROPHY:
+      if (basicTrophy.system_id === 'first_recycling_challange'
+        && data?.supportedMaterialScans?.some(it => String(it.addedPerson) === String(userId))
+      ) {
+        // first recycling
+        if (!userTrophy) {
+          put(UserActions.setIsNewUser(false));
+          const userNewGettingStartedTrophy = {
+            achievedAt: new Date(),
+            achievement: {
+              description: basicTrophy.description,
+              unlockExtraDescription: basicTrophy.unlock_extra_description,
+              image: basicTrophy.image.source,
+              levels_data: basicTrophy.levels_data,
+              name: basicTrophy.name,
+              system_id: basicTrophy.system_id,
+              order: basicTrophy.order,
+            },
+            extraInfo: {
+              level: 1,
+              achieved_at_level_1: new Date(),
+            },
+            _id: new Date().toISOString(),
+          };
+          newUserTrophies.push(userNewGettingStartedTrophy);
+          notifArray.push({
+            id: basicTrophy.system_id,
+            name: basicTrophy.name,
+            description: basicTrophy.description,
+            image: basicTrophy.image.source,
+            amount: 1,
+            level: 1,
+            type: 'level_based',
+            unlockExtraDescription: basicTrophy.unlock_extra_description,
+          });
+        }
+      }
+      // IMAGE_RECYCLING (VARTA)
+      if (basicTrophy.trophy_type === IMAGE_RECYCLING) {
+        const listOfCodes = userTrophy?.achievement?.list_of_codes;
+        const isProductRecycled = data?.supportedMaterialScans?.some(it => (String(it.addedPerson) === String(userId)) && listOfCodes?.includes(it.code)) ?? false;
+        if (userTrophy?.extraInfo?.level === 1 && isProductRecycled) {
+          const item = {
+            id: userTrophy.achievement.system_id,
+            name: userTrophy.achievement.name,
+            description: userTrophy.achievement.description,
+            unlockExtraDescription: userTrophy.achievement.unlock_extra_description,
+            image: userTrophy.achievement.image.source,
+            amount: 2,
+            level: 2,
+            type: 'image_recycling',
+            hasReward: userTrophy.achievement.has_reward,
+            reward: {
+              cash: userTrophy.achievement.price?.cash,
+              points: userTrophy.achievement.price?.points,
+            },
+          };
+          notifArray.push(item);
+          const newImageRecyclingTrophy = {
+            ...userTrophy,
+            extraInfo: {
+              level: 2,
+              achieved_at_level_1: new Date(),
+            },
+          };
+          newUserTrophies.push(newImageRecyclingTrophy);
+        }
+      }
+      // JNJ:
+      if (basicTrophy.system_id === 'jnj_challenge') {
+        // JNJ adding locally to user-trophies when recycle first time
+        const isJnJRecycled = data?.supportedMaterialScans?.some(it => (String(it.addedPerson) === String(userId)) && (it?.brand_id === basicTrophy?.brand_id)) ?? false;
+        if (!userTrophy && isJnJRecycled) {
+          const userNewJnJTrophy = {
+            achievedAt: new Date(),
+            achievement: {
+              ...basicTrophy,
+            },
+            extraInfo: {
+              level: 0,
+              achieved_at_level_1: null,
+            },
+            _id: new Date().toISOString(),
+          };
+          newUserTrophies.push(userNewJnJTrophy);
+        }
+      } // end for jnj
+    }
+
+    yield all(trophies.map(item => call(handleTrophySaga, item)));
+    // UPDATE LOCAL STATE: 2 STEPS:
+    // 1 update local user trophies state -> 1) REPLACE:
+    const newUserTrophiesArray = userTrophies.map(ut => {
+      const newUt = newUserTrophies.find(i => i?.achievement?.system_id === ut.achievement.system_id);
+      // if already have SUCCESS recurring trophy:
+      if (newUt && ut.achievement.trophy_type === 'recurring' && ut.extraInfo.level > 0) {
+        return ut; // return old reached recurring trophy, without replacing
+      }
+      if (newUt) {
+        return newUt; // replace to new userTrophy
+      }
+      return ut;
+    });
+
+    // 2 update local user trophies state -> 2) ADD:
+    if (newUserTrophies?.length > 0) {
+      newUserTrophies.forEach(newTrophy => {
+      // if already have SUCCESS recurring trophy:
+        const isOldRecurring = newTrophy.achievement.trophy_type === 'recurring'
+          && newTrophy.achievement.isChallengeBetweenStartAndEndDate
+          && userTrophies.find(ut => (ut.achievement.system_id === newTrophy?.achievement?.system_id) && ut.extraInfo.level > 0);
+        const oldNotRecurring = newTrophy && !userTrophies.find(ut => ut.achievement.system_id === newTrophy?.achievement?.system_id);
+        if (isOldRecurring || oldNotRecurring) {
+          newUserTrophiesArray.push(newTrophy); // add new userTrophy
+        }
+      });
+    }
+    // STREAKS: local updating
+    if (packagesAmount > 0 && recycleHistory?.length) { // was recycle
+      const lastRecyclingDate = recycleHistory[recycleHistory.length - 1].date;
+      const weekOfLastRecycling = dayjs(lastRecyclingDate).isoWeek();
+      const currentWeekOfYear = dayjs().isoWeek();
+      if (currentWeekOfYear > weekOfLastRecycling) { // is next week recycling
+        const newHistoryItem = {
+          date: new Date(),
+          _id: new Date().toISOString(),
+        };
+        const newRecycleHistory = [
+          ...recycleHistory,
+          newHistoryItem,
+        ];
+        yield put(UserActions.setRecycleHistory(newRecycleHistory));
+      }
+    }
+
+    yield put(UserActions.setUserTrophies(newUserTrophiesArray));
+    yield call(updateCurrentTrophiesState);
+
+    // send modals
+    if (notifArray.length > 0) {
+      const ids = notifArray.map(i => i.id);
+      yield put(TrophiesActions.setModalShownIds(ids)); // for postponed action
+      yield all(notifArray.map(item => put(AppTrophyNotificationActions.addTrophyNotification(item))));
+    }
+
+    // send analytics
+    if (analyticsArray.length > 0) {
+      yield all(analyticsArray.map(item => call(
+        AnalyticsService.sendEvent, ANALYTICS_EVENTS.TROPHIES_TROPHY_UNLOCKED, { data: item },
+      )));
+    }
+  } catch (err) {
+    Log.log({ err });
+  }
+}
+
+export default () => [
+  takeEvery(ScannerTypes2.SCAN_SUCCESS, updateTrophiesOnScanSaga),
+  takeEvery(ScannerTypes2.CONFIRM_SCAN_SUCCESS, calculateUserTrophiesSaga),
+];
