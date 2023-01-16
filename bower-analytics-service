@@ -1,0 +1,68 @@
+import analytics from '@react-native-firebase/analytics';
+
+import { deviceInfo } from 'src/Utils/deviceInfo';
+import Log from 'src/Services/Log';
+
+export class FirebaseAnalyticsService {
+    static identifyUser = async (userObject = {}) => {
+      const {
+        id: userId,
+        email,
+        fullname,
+        phone,
+        emailVerified,
+        phoneVerified,
+        gender,
+        lang,
+        countryCode,
+        featureFlags,
+        preferences: {
+          enabledPushNotifications,
+          enabledEmailNotifications,
+        } = {},
+      } = userObject;
+
+      if (userId) {
+        try {
+          await analytics().setUserId(String(userId));
+
+          await analytics().setUserProperty('appCountryCode', countryCode);
+
+          await analytics().logEvent('user_registered', {
+            userId,
+            email,
+            fullname,
+            lang,
+            phone,
+            attributes: {
+              country: countryCode,
+              featureFlags,
+              emailVerified,
+              phoneVerified,
+              pushNotificationsEnabled: enabledPushNotifications,
+              emailNotificationsEnabled: enabledEmailNotifications,
+              gender,
+              ...deviceInfo,
+            },
+          });
+        } catch (e) {
+          Log.error(e);
+        }
+      }
+    }
+
+  static normalizeEventName = (eventName) => eventName.split(' ').join('_').replace(':', '').toLowerCase();
+
+  static sendEvent = async ({ eventName, eventData = {} }) => {
+    try {
+      const normalizedEventName = this.normalizeEventName(eventName);
+      await analytics().logEvent(normalizedEventName, {
+        ...eventData,
+      });
+    } catch (e) {
+      Log.error(e);
+    }
+  }
+}
+
+export default FirebaseAnalyticsService;
