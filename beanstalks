@@ -1,0 +1,296 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import {
+  StyleSheet,
+  Text,
+  View,
+  TouchableOpacity,
+  StatusBar,
+  FlatList,
+  ListRenderItem,
+  RefreshControl,
+  NativeSyntheticEvent,
+  NativeScrollEvent,
+} from 'react-native';
+import { FormattedMessage } from 'react-intl';
+import { isTablet } from 'react-native-device-info';
+import moment from 'moment';
+import {
+  Calendar,
+  CalendarActions,
+  Dimensions,
+  useCurrentSchool,
+  Colors,
+  Fonts,
+  useCurrentAppMode,
+  AppMode,
+} from 'beanstalk-shared';
+import { Icon } from 'src/Components/Icons';
+import { CurvedHeaderBackground } from 'src/Components/NavigationHeaders/CurvedHeaderBackground';
+import { CalendarEventsDetailModal, CalendarEventModalContent } from 'src/Screens/CalendarEvents/CalendarEventsDetailModal';
+import CalendarEmptyStateIcon from 'src/Components/Generated/Icons/CalendarEmptyStateIcon';
+import { CalendarEventsScreenNavigationProp } from 'src/Screens/CalendarEvents/CalendarEventsScreenNavigator';
+import { useAnalyticsService } from 'src/Providers/CommonServicesProvider';
+import { AnalyticsEventNames } from 'src/Analytics/AnalyticsEventNames';
+
+interface CalendarEventsScreenProps {
+  navigation: CalendarEventsScreenNavigationProp
+}
+
+interface IUserEvent {
+  id: string
+  title: string
+  description?: string
+}
+
+export interface IUserEvents {
+  events: IUserEvent[]
+  date: string
+}
+
+const HeaderBackground = () => {
+  return (
+    <CurvedHeaderBackground
+      outerBackgroundStyle={styles.outerBackground}
+      curvedBackgroundStyle={styles.curvedBackground}
+    >
+      <Icon
+        name="header-squiggle-shape"
+        color={Colors.blue100}
+        style={[
+          styles.headerSquiggleShape,
+          isTablet() && styles.headerSquiggleShapeTablet,
+        ]}
+        width={300}
+        height={120}
+      />
+      <Icon
+        name="header-swirl-shape"
+        style={[
+          styles.headerSwirlShape,
+          isTablet() && styles.headerSwirlShapeTablet,
+        ]}
+        color={Colors.blue100}
+        opacity={1}
+        width={isTablet() ? 250 : 110}
+        height={isTablet() ? 210 : 115}
+      />
+    </CurvedHeaderBackground>
+  );
+};
+
+export const CalendarEventsScreen = ({ navigation }: CalendarEventsScreenProps) => {
+  const currentMode = useCurrentAppMode();
+  const analyticsService = useAnalyticsService();
+  const school = useCurrentSchool();
+  const [showEventModal, setShowEventModal] = useState(false);
+  const [modalContent, setModalContent] = useState<CalendarEventModalContent>({ title: '', description: '', date: '' });
+  const [month, setMonth] = useState(moment().toISOString());
+  const [headerShadowOpacity, setHeaderShadowOpacity] = useState(0);
+  const [events, setEvents] = useState<IUserEvents[]>([]);
+
+  const recombineEvents = (event: Calendar[] | void) => {
+    if (!event) return;
+
+    const initial: IUserEvents[] = [];
+    const formatDay = (date: string): string => moment(date).format('DD');
+
+    const userEvents = event.reduce((acc, el) => {
+      let result = [...acc];
+      const currDay = moment(el.EventDate).format('DD');
+
+      if (result.some((e) => formatDay(e.date) === currDay)) {
+        const currentEvent = result.find((e) => formatDay(e.date) === currDay)!;
+        const otherEvents = result.filter((e) => formatDay(e.date) !== currDay);
+        currentEvent.events.push({
+          id: el.CalendarId, title: el.EventName, description: el.EventDetails,
+        });
+        result = [
+          ...otherEvents,
+          currentEvent,
+        ];
+      } else {
+        result.push({
+          date: el.EventDate,
+          events: [{ id: el.CalendarId, title: el.EventName, description: el.EventDetails }],
+        });
+      }
+
+      return result;
+    }, initial);
+
+    setEvents(userEvents);
+  };
+
+  const getEvents = useCallback(
+    async () => {
+      const ev = await CalendarActions.getCalendarEvents({
+        schoolId: school.SchoolId,
+        calendarMonthDate: month,
+      });
+      recombineEvents(ev);
+    },
+    [month, school],
+  );
+
+  useEffect(() => {
+    getEvents();
+  }, [month, school, getEvents]);
+
+  useEffect(() => {
+    analyticsService.logEvent(AnalyticsEventNames.VIEW_CALENDAR);
+  }, [analyticsService]);
+
+  const onRefresh = () => getEvents();
+
+  const onPrevPress = () => setMonth(moment(month).subtract(1, 'month').toISOString());
+  const onNextPress = () => setMonth(moment(month).add(1, 'month').toISOString());
+
+  const openEventModal = (content: CalendarEventModalContent, id: string) => () => {
+    setModalContent(content);
+    setShowEventModal(true);
+    analyticsService.logEvent(AnalyticsEventNames.VIEW_CALENDAR_DETAILS, { id });
+  };
+
+  const isBeforePastMonth = moment(month).isBefore(moment().subtract(1, 'month'));
+  const isAfterNextMonth = moment(month).isAfter(moment());
+
+  const onScroll = (event: NativeSyntheticEvent<NativeScrollEvent>) => {
+    if (event.nativeEvent.contentOffset.y > 20) {
+      setHeaderShadowOpacity(0.05);
+    } else {
+      setHeaderShadowOpacity(0);
+    }
+  };
+
+  const itemSeparator = () => <View style={styles.separator} />;
+
+  const listEmpty = () => (
+    <View style={styles.emptyState}>
+      <CalendarEmptyStateIcon style={{ marginBottom: 15 }} />
+      <Text style={styles.eventText}>
+        <FormattedMessage
+          defaultMessage="There are no events scheduled for this month."
+          description="There are no events scheduled for this month."
+        />
+      </Text>
+    </View>
+  );
+
+  const rowDayEvents: ListRenderItem<IUserEvents> = ({ item }) => {
+    return (
+      <View style={[styles.dayItem, isTablet() && styles.listWrapperTablet]}>
+        <View style={styles.row}>
+          <View style={styles.left}>
+            <Text style={styles.dayNumber}>{moment(item.date).format('D')}</Text>
+            <Text style={styles.dayWeek}>{moment(item.date).format('ddd')}</Text>
+          </View>
+          <View style={styles.right}>
+            <View style={styles.eventsContainer}>
+              {item.events.map((e) => (
+                <TouchableOpacity
+                  key={e.id}
+                  testID={e.id}
+                  style={styles.event}
+                  onPress={openEventModal({
+                    title: e.title,
+                    description: e.description,
+                    date: item.date,
+                  }, e.id)}
+                >
+                  <Text style={styles.eventTitle}>{e.title}</Text>
+                  {e.description ? <Text style={styles.eventText}>{e.description}</Text> : null}
+                </TouchableOpacity>
+              ))}
+            </View>
+          </View>
+        </View>
+      </View>
+    );
+  };
+
+  return (
+    <View style={styles.body}>
+      {
+        showEventModal
+          ? (
+            <CalendarEventsDetailModal
+              toggleModal={() => {
+                setShowEventModal(!showEventModal);
+              }}
+              modalContent={modalContent}
+            />
+          )
+          : null
+      }
+      <StatusBar barStyle="dark-content" />
+      {currentMode !== AppMode.schoolLeadership && (
+        <View style={styles.header}>
+          {HeaderBackground()}
+          <TouchableOpacity
+            style={styles.headerButtonContainer}
+            onPress={() => navigation.goBack()}
+          >
+            <Icon name="chevron-left" color={Colors.blue700} />
+            {isTablet() && <Text style={styles.backText}>Back</Text>}
+          </TouchableOpacity>
+          <View style={styles.titleContainer}>
+            <Text style={styles.title}>Calendar</Text>
+          </View>
+        </View>
+      )}
+      <View style={[
+        styles.listWrapper,
+        currentMode === AppMode.schoolLeadership && { marginTop: 60 },
+      ]}
+      >
+        <View
+          style={[
+            styles.dateContainer,
+            {
+              shadowOffset: { width: 0, height: 4 },
+              shadowRadius: 2,
+              shadowOpacity: headerShadowOpacity,
+              elevation: headerShadowOpacity * 100,
+            },
+          ]}
+        >
+          <TouchableOpacity
+            disabled={isBeforePastMonth}
+            testID="calendar_prev_month"
+            style={[styles.prevButton, isBeforePastMonth && styles.disabledButton]}
+            onPress={onPrevPress}
+          >
+            <Icon name="chevron-left" color={Colors.blue700} />
+          </TouchableOpacity>
+          <Text testID="calendar_month" style={styles.month}>{moment(month).format('MMM YYYY')}</Text>
+          <TouchableOpacity
+            disabled={isAfterNextMonth}
+            testID="calendar_next_month"
+            style={[styles.nextButton, isAfterNextMonth && styles.disabledButton]}
+            onPress={onNextPress}
+          >
+            <Icon name="chevron-left" color={Colors.blue700} />
+          </TouchableOpacity>
+        </View>
+        <FlatList
+          data={events}
+          keyExtractor={(item) => item.date}
+          renderItem={rowDayEvents}
+          ListEmptyComponent={listEmpty}
+          ItemSeparatorComponent={itemSeparator}
+          scrollEventThrottle={16}
+          showsVerticalScrollIndicator={false}
+          contentContainerStyle={!events.length && { flex: 1 }}
+          onScroll={onScroll}
+          refreshControl={(
+            <RefreshControl
+              style={{ opacity: 0 }}
+              refreshing={false}
+              onRefresh={onRefresh}
+            />
+          )}
+        />
+      </View>
+    </View>
+  );
+};
