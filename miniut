@@ -1,0 +1,210 @@
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import {
+  View,
+  Text,
+  ScrollView,
+  TouchableOpacity,
+  SafeAreaView,
+  FlatList,
+  ActivityIndicator,
+} from 'react-native';
+import { NavigationFunctionComponent } from 'react-native-navigation';
+import colors from '@assets/colors';
+import LittleLogo from '@assets/icons/logo-small.svg';
+import SettingsIcon from '@assets/icons/settings.svg';
+import ButtonPrimary from '@components/Button';
+import { QUESTIONS_PER_PAGE } from '@constants/react';
+import IQuestion from '@interfaces/redux/app/IQuestion';
+import ModalNavigator from '@navigation/navigators/modals';
+import Filter from './Filter';
+import Question from './Question';
+import SearchInput from './SearchInput';
+import data from './data';
+import { IHomeDispatchToProps, IHomeStateToProps } from './index.props';
+import styles from './styles';
+
+type Props = IHomeStateToProps & IHomeDispatchToProps;
+
+/**
+ * Home screen
+ * @constructor
+ */
+const Home: NavigationFunctionComponent<Props> = ({
+  questions,
+  getQuestions,
+  filterValue,
+  setFilterValue,
+  questionLike,
+  questionDislike,
+  userId,
+  searchQuestions,
+  searchQuestionsClear,
+  searchValue,
+}) => {
+  const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
+
+  const { t } = useTranslation(['common', 'app']);
+
+  /**
+   * Get first questions page
+   */
+  useEffect(() => getQuestions(), [getQuestions]);
+
+  /**
+   * Cancel refreshing (remove preloader)
+   */
+  useEffect(() => {
+    if (isRefreshing && !questions.fetching) {
+      setIsRefreshing(false);
+    }
+  }, [isRefreshing, questions.fetching]);
+
+  const onPressAskQuestion = useCallback(() => ModalNavigator.askQuestion(), []);
+
+  const onPressPersonalSetting = useCallback(() => ModalNavigator.personalSetting(), []);
+
+  /**
+   * Render question item
+   */
+  const renderItem = useCallback(
+    ({ item }) => (
+      <Question
+        {...item}
+        currentUserId={userId}
+        onLike={questionLike}
+        onDislike={questionDislike}
+        isColored
+      />
+    ),
+    [questionDislike, questionLike, userId],
+  );
+
+  /**
+   * Define FlatList keyExtractor
+   */
+  const keyExtractor = useCallback((question: IQuestion) => `question-${question.id}`, []);
+
+  /**
+   * Handle flat list end reached
+   * (pagination)
+   */
+  const onEndReached = useCallback(() => {
+    if (questions.result?.length === 0 || questions.currentPage >= questions.totalPages) {
+      return;
+    }
+
+    getQuestions(questions.currentPage + 1);
+  }, [getQuestions, questions.currentPage, questions.result?.length, questions.totalPages]);
+
+  /**
+   * Refresh questions
+   */
+  const onRefresh = useCallback(() => {
+    setIsRefreshing(true);
+    getQuestions();
+  }, [getQuestions]);
+
+  /**
+   * Render empty message if no questions
+   */
+  const listEmptyComponent = useMemo(() => {
+    if (questions.result?.length > 0 || questions.fetching) {
+      return;
+    }
+
+    return (
+      <View style={styles.textContainer}>
+        <Text style={styles.emptyList}>{t('app:emptyQuestions')}</Text>
+      </View>
+    );
+  }, [questions.fetching, questions.result?.length, t]);
+
+  /**
+   * Show loading for flat list
+   */
+  const listFooterComponent = useMemo(() => {
+    if (!questions.fetching || isRefreshing) {
+      return null;
+    }
+
+    return (
+      <View style={styles.indicatorContainer}>
+        <ActivityIndicator color={colors.primary} style={styles.indicatorView} />
+      </View>
+    );
+  }, [isRefreshing, questions.fetching]);
+
+  const hasQuestions = Boolean(questions.result?.length);
+  const contentContainerStyle = useMemo(
+    () => [styles.flatListContent, !hasQuestions && styles.centerEmptySet],
+    [hasQuestions],
+  );
+
+  return (
+    <SafeAreaView style={styles.safeArea}>
+      <View style={styles.container}>
+        <View style={styles.topBar}>
+          <TouchableOpacity onPress={onPressPersonalSetting}>
+            <SettingsIcon style={styles.settingsIcon} />
+          </TouchableOpacity>
+
+          <View style={styles.logoContainer}>
+            <Text style={styles.logoText}>{t('common:appName')}</Text>
+          </View>
+
+          <LittleLogo style={styles.littleLogo} />
+        </View>
+      </View>
+      <View>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+          {data.map(({ image, value, isLast, isFirst }) => (
+            <Filter
+              key={value}
+              onPress={setFilterValue}
+              activeIndex={filterValue}
+              index={value}
+              image={image}
+              title={t(`app:${value}` as const)}
+              isLast={isLast}
+              isFirst={isFirst}
+            />
+          ))}
+        </ScrollView>
+        <View style={[styles.container, styles.searchContainer]}>
+          <SearchInput
+            onChangeText={searchQuestions}
+            onClean={searchQuestionsClear}
+            value={searchValue}
+          />
+        </View>
+      </View>
+      <FlatList
+        initialNumToRender={QUESTIONS_PER_PAGE}
+        data={questions.result}
+        renderItem={renderItem}
+        keyExtractor={keyExtractor}
+        showsVerticalScrollIndicator={false}
+        contentContainerStyle={contentContainerStyle}
+        refreshing={isRefreshing}
+        onRefresh={onRefresh}
+        onEndReachedThreshold={0.5}
+        onEndReached={onEndReached}
+        ListEmptyComponent={listEmptyComponent}
+        ListFooterComponent={listFooterComponent}
+      />
+      {questions.error?.length > 0 && <Text style={styles.errorList}>{questions.error}</Text>}
+      <View style={[styles.container, styles.buttonsContainer]}>
+        <ButtonPrimary onPress={onPressAskQuestion}>{t('app:sendButton')}</ButtonPrimary>
+      </View>
+    </SafeAreaView>
+  );
+};
+
+Home.options = {
+  topBar: {
+    visible: false,
+  },
+};
+
+export default Home;
